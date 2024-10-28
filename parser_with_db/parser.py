@@ -10,7 +10,7 @@ import aiohttp
 DB_PATH = os.path.join(os.path.dirname(__file__), "data_db.db")
 
 # период между опросами парсера в секундах
-PERIOD_BETWEEN_REQUEST = 36
+PERIOD_BETWEEN_REQUEST = 9
 
 # настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -53,18 +53,19 @@ TYPES_SECURITIES = [[OFZ_BONDS, OFZ_BOND_URL],
                     [CORP_BONDS, CORPORATE_BOND_URL]]
 
 
-async def request_securities(url):
+async def request_securities(client, url):
     """ Запрос к MOEX """
 
+    logger.info("Запрос парсера %s", url)
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=5) as resp:
-                content = await resp.json(content_type=None)
-        logger.info("Запрос парсера успешно выполнен")
-        return content
+        async with client.get(url, timeout=5) as response:
+            response.raise_for_status()
+            content = await response.json(content_type=None)
+        logger.info("Запрос успешно выполнен")
     except aiohttp.ClientError as e:
         logger.error("Ошибка выполнения запроса: %s", e)
         return None
+    return content
 
 
 async def create_column_typing(response):
@@ -92,11 +93,13 @@ async def create_column_typing(response):
     finish_data.append(column_typing)
     finish_data.append(len(example_for_definition))
 
-    if list_of_columns != BOND_COLUMN_TEMPLATE:
-        error_message = "Схема таблицы не совпадает с шаблоном:\n"
-        error_message += f"Текущая схема: {list_of_columns}\n"
-        error_message += f"Шаблон схемы: {BOND_COLUMN_TEMPLATE}"
-        raise ValueError(error_message)
+    try:
+        if list_of_columns != BOND_COLUMN_TEMPLATE:
+            logger.error("Схема таблицы не совпадает с шаблоном")
+            return None
+    except ValueError as e:
+        logger.error("Ошибка проверки схемы таблицы: %s", e)
+        return None, None
 
     return finish_data
 
@@ -142,7 +145,6 @@ async def writing_finished_data(column_count, table_name, securities_list):
 
                 for i in range(column_count):
                     await cursor.execute(insert_query, (securities_list[i]))
-
                 await db_connection.commit()
                 logger.info("Записи успешно добавлены в таблицу")
 
@@ -153,28 +155,28 @@ async def writing_finished_data(column_count, table_name, securities_list):
 async def processing(name_table, url):
     """ Обработка цепочки вызовов """
 
-    response = await request_securities(url)
+    async with aiohttp.ClientSession() as session:
+        response = await request_securities(session, url)
+
     securities_list = response["securities"]["data"]
-    if response is None:
-        logger.error("Ошибка получения данных от MOEX")
-    else:
-        column_create = await create_column_typing(response)
-        if column_create is None:
-            logger.error("Не удалось создать схему таблицы.")
-        else:
-            await create_db_tables(column_create[0], name_table)
-            if create_db_tables is None:
-                logger.error("Не удалось создать таблицу.")
-            else:
-                await writing_finished_data(column_create[1], name_table,
-                                            securities_list)
+
+    column_create = await create_column_typing(response)
+    await create_db_tables(column_create[0], name_table)
+    await writing_finished_data(column_create[1], name_table,
+                                securities_list)
 
 
 async def main():
     """ Главная обработка цепочки вызовов """
 
     for name_table, url in TYPES_SECURITIES:
-        await processing(name_table, url)
+        try:
+            await processing(name_table, url)
+        except (aiohttp.ClientError, IndexError, KeyError,
+                TypeError, ValueError, aiosqlite.Error):
+            logger.error("Ошибка выполнения процесса")
+        finally:
+            logger.info("Цикл обработки запроса и записи в БД завершен\n")
 
     await asyncio.sleep(PERIOD_BETWEEN_REQUEST)
 
