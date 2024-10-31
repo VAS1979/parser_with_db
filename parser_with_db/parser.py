@@ -1,185 +1,37 @@
 """ Создание и заполнение базы данных парсером"""
 
-import os
 import asyncio
-import logging
 import aiosqlite
 import aiohttp
 
-# путь к базе данных
-DB_PATH = os.path.join(os.path.dirname(__file__), "data_db.db")
-
-# период между опросами парсера в секундах
-PERIOD_BETWEEN_REQUEST = 9
-
-# настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# адрес запроса к MOEX по корпоративным облигациям
-CORPORATE_BOND_URL = ("https://iss.moex.com/iss/engines/stock/markets/bonds/"
-                      "boards/TQCB/securities.json?iss.meta=off")
-# адрес запроса к MOEX по ОФЗ
-OFZ_BOND_URL = ("https://iss.moex.com/iss/engines/stock/markets/bonds/boards"
-                "/TQOB/securities.json?iss.meta=off")
-
-# словарь приведения соответствия типов данных
-convert_types = {
-    "<class 'str'>": "TEXT",
-    "<class 'float'>": "REAL",
-    "<class 'int'>": "INTEGER",
-    "<class 'NoneType'>": "NUMERIC"
-        }
-
-# Названия таблиц в базе данных
-OFZ_BONDS = "ofz_bonds"
-CORP_BONDS = "corp_bonds"
-
-# Шаблон для проверки изменений типов и наименований столбцов таблицы
-BOND_COLUMN_TEMPLATE = [
-    'SECID', 'BOARDID', 'SHORTNAME', 'PREVWAPRICE',
-    'YIELDATPREVWAPRICE', 'COUPONVALUE', 'NEXTCOUPON', 'ACCRUEDINT',
-    'PREVPRICE', 'LOTSIZE', 'FACEVALUE', 'BOARDNAME', 'STATUS', 'MATDATE',
-    'DECIMALS', 'COUPONPERIOD', 'ISSUESIZE', 'PREVLEGALCLOSEPRICE',
-    'PREVDATE', 'SECNAME', 'REMARKS', 'MARKETCODE', 'INSTRID', 'SECTORID',
-    'MINSTEP', 'FACEUNIT', 'BUYBACKPRICE', 'BUYBACKDATE', 'ISIN', 'LATNAME',
-    'REGNUMBER', 'CURRENCYID', 'ISSUESIZEPLACED', 'LISTLEVEL', 'SECTYPE',
-    'COUPONPERCENT', 'OFFERDATE', 'SETTLEDATE', 'LOTVALUE',
-    'FACEVALUEONSETTLEDATE'
-    ]
-
-# список соответствий названий таблиц и адресов шлюзов
-TYPES_SECURITIES = [[OFZ_BONDS, OFZ_BOND_URL],
-                    [CORP_BONDS, CORPORATE_BOND_URL]]
-
-
-async def request_securities(client, url):
-    """ Запрос к MOEX """
-
-    logger.info("Запрос парсера %s", url)
-    try:
-        async with client.get(url, timeout=5) as response:
-            response.raise_for_status()
-            content = await response.json(content_type=None)
-        logger.info("Запрос успешно выполнен")
-    except aiohttp.ClientError as e:
-        logger.error("Ошибка выполнения запроса: %s", e)
-        return None
-    return content
-
-
-async def create_column_typing(response):
-    """ Создает строки с типизированными
-    наименованиями колонок """
-
-    list_of_columns = response["securities"]["columns"]
-    example_for_definition = response["securities"]["data"][0]
-
-    column_typing = ""
-    finish_data = []
-
-    try:
-        for i, value in enumerate(example_for_definition):
-            column_name = list_of_columns[i]
-            column_type = convert_types[str(type(value))]
-            temp_value = f"{column_name} {column_type}, "
-            column_typing += temp_value
-        column_typing = column_typing[0:-2]
-        logger.info("Схема таблицы успешно создана")
-    except (IndexError, KeyError, TypeError) as e:
-        logger.error("Ошибка обработки данных в цикле: %s", e)
-        return None, None
-
-    finish_data.append(column_typing)
-    finish_data.append(len(example_for_definition))
-
-    try:
-        if list_of_columns != BOND_COLUMN_TEMPLATE:
-            logger.error("Схема таблицы не совпадает с шаблоном")
-            return None
-    except ValueError as e:
-        logger.error("Ошибка проверки схемы таблицы: %s", e)
-        return None, None
-
-    return finish_data
-
-
-async def create_db_tables(column_create, table_name):
-    """ Создает базу, если ее нет, создает таблицу
-    если ее нет, пересоздает если уже имеются """
-
-    create_table = f"CREATE TABLE IF NOT EXISTS \
-        {table_name} ({column_create})"
-    try:
-        async with aiosqlite.connect("data_db.db") as db_connection:
-            async with db_connection.cursor() as cursor:
-                logger.info("Соединение для создания %s открыто", table_name)
-
-                # Удаляет существующую таблицу
-                await cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-                await db_connection.commit()
-
-                # Создает новую таблицу
-                await cursor.execute(create_table)
-                await db_connection.commit()
-                logger.info("Соединение для создания %s закрыто", table_name)
-                logger.info("Таблица %s успешно создана.", table_name)
-    except aiosqlite.Error as e:
-        logger.error("Ошибка при создании/обновлении таблицы: %s", e)
-    return None
-
-
-async def writing_finished_data(column_count, table_name, securities_list):
-    """ Заполняет базу данных значениями из
-    полученного ответа на запрос парсера """
-
-    try:
-        async with aiosqlite.connect("data_db.db") as db_connection:
-            async with db_connection.cursor() as cursor:
-
-                insert_query = f"INSERT INTO {table_name} VALUES \
-                    ({','.join(['?'] * column_count)})"
-
-                await cursor.execute(f"DELETE FROM {table_name}")
-                await db_connection.commit()
-
-                for i in range(column_count):
-                    await cursor.execute(insert_query, (securities_list[i]))
-                await db_connection.commit()
-                logger.info("Записи успешно добавлены в таблицу")
-
-    except aiosqlite.Error:
-        logger.error("Ошибка при подключении к базе данных")
-
-
-async def processing(name_table, url):
-    """ Обработка цепочки вызовов """
-
-    async with aiohttp.ClientSession() as session:
-        response = await request_securities(session, url)
-
-    securities_list = response["securities"]["data"]
-
-    column_create = await create_column_typing(response)
-    await create_db_tables(column_create[0], name_table)
-    await writing_finished_data(column_create[1], name_table,
-                                securities_list)
+from parser_with_db.src.config import (PERIOD_BETWEEN_REQUEST, logger,
+                                       SHARE_SBER_URL, TYPES_SECURITIES)
+from parser_with_db.src.requests import request_share_sber
+from parser_with_db.src.processor import handle_call_chain
 
 
 async def main():
-    """ Главная обработка цепочки вызовов """
+    """Обрабатывает цикл вызовов
+    обработчика запросов """
 
-    for name_table, url in TYPES_SECURITIES:
-        try:
-            await processing(name_table, url)
-        except (aiohttp.ClientError, IndexError, KeyError,
-                TypeError, ValueError, aiosqlite.Error):
-            logger.error("Ошибка выполнения процесса")
-        finally:
-            logger.info("Цикл обработки запроса и записи в БД завершен\n")
+    try:
+        await request_share_sber(SHARE_SBER_URL)
+    except (aiohttp.ClientError, IndexError, KeyError,
+            TypeError, ValueError, aiosqlite.Error) as s:
+        logger.error("Ошибка запроса тестовой цены, %s", s)
+    else:
+        for name_table, url, template in TYPES_SECURITIES:
+            try:
+                await handle_call_chain(name_table, url, template)
+            except (aiohttp.ClientError, IndexError, KeyError,
+                    TypeError, ValueError, aiosqlite.Error):
+                logger.error("Ошибка выполнения процесса")
+            finally:
+                logger.info("Цикл обработки запроса и записи в БД завершен\n")
 
     await asyncio.sleep(PERIOD_BETWEEN_REQUEST)
 
 
-while True:
-    asyncio.run(main())
+if __name__ == "__main__":
+    while True:
+        asyncio.run(main())
